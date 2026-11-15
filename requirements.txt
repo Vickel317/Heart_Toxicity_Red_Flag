@@ -1,0 +1,10 @@
+rdkit
+pytdc
+scikit-learn
+shap
+scipy
+pandas
+numpy
+matplotlib
+streamlit
+jupyter
