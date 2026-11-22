@@ -1,5 +1,6 @@
 rdkit
 pytdc
+joblib
 scikit-learn
 shap
 scipy
