@@ -1,5 +1,4 @@
 rdkit
-pytdc
 joblib
 scikit-learn
 shap
@@ -9,3 +8,8 @@ numpy
 matplotlib
 streamlit
 jupyter
+
+# pytdc is deliberately NOT listed. It pins numpy<2, pandas<3 and rdkit<2024.3.1,
+# all older than what this project uses, and on Windows it pulls in tiledbsoma,
+# which has no wheel and fails to build. The TDC datasets are plain tab separated
+# files on Harvard Dataverse, so notebook 01 downloads them directly instead.

@@ -12,10 +12,87 @@
 # most of the rows, and a silent loss here looks like "this plant has no known
 # compounds", which is the wrong answer.
 
+import glob
+import os
 import re
 import zipfile
 
 import pandas as pd
+
+# Where the bulk download might reasonably be sitting, relative to a notebook
+# in notebooks/. COCONUT reissues the file monthly and the release date is in
+# the name (coconut_csv-11-2026.csv for November 2026), so nothing here pins a
+# single filename: a pinned name breaks silently the moment a newer release is
+# downloaded. The file may be left zipped or unzipped, and either works.
+BULK_SEARCH_DIRS = [
+    os.path.join("..", "data", "coconut"),
+    os.path.join("..", "data", "raw"),
+    os.path.join("data", "coconut"),
+    os.path.join("data", "raw"),
+]
+
+BULK_PATTERNS = ["coconut_csv*.zip", "coconut_csv*.csv"]
+
+DOWNLOAD_HINT = (
+    "Download the COCONUT CSV bulk file from "
+    "https://coconut.naturalproducts.net/download and save it under "
+    "data/raw/ (the zip or the unzipped csv, either is fine)."
+)
+
+
+def find_bulk(search_dirs=None):
+    # Locate the COCONUT bulk file without hard coding a release name.
+    # Raises with the download instructions rather than returning None, because
+    # a missing dataset should stop the notebook loudly, not produce an empty
+    # result that reads like "these plants have no compounds".
+    search_dirs = search_dirs or BULK_SEARCH_DIRS
+
+    found = []
+    for directory in search_dirs:
+        for pattern in BULK_PATTERNS:
+            found.extend(glob.glob(os.path.join(directory, pattern)))
+
+    if not found:
+        raise FileNotFoundError("No COCONUT bulk file found. " + DOWNLOAD_HINT)
+
+    # Sorting by name puts the newest release last, because the dates are in
+    # the filenames. Preferring the unzipped csv when both exist just avoids
+    # paying for decompression on every chunk.
+    found.sort()
+    plain = [f for f in found if f.lower().endswith(".csv")]
+    return (plain or found)[-1]
+
+
+def _bulk_reader(path, member, chunksize, usecols):
+    # Open the bulk file for chunked reading, whether it is a zip or a plain
+    # csv, and return (chunk iterator, cleanup callable).
+    read_kwargs = dict(
+        chunksize=chunksize,
+        usecols=usecols,
+        dtype=str,
+        on_bad_lines="warn",
+        low_memory=False,
+    )
+
+    if str(path).lower().endswith(".zip"):
+        archive = zipfile.ZipFile(path)
+        if member is None:
+            names = [n for n in archive.namelist() if n.lower().endswith(".csv")]
+            if len(names) != 1:
+                archive.close()
+                raise ValueError(f"expected one CSV in the zip, found {names}")
+            member = names[0]
+        handle = archive.open(member)
+
+        def close():
+            handle.close()
+            archive.close()
+
+        return pd.read_csv(handle, **read_kwargs), close
+
+    # Plain csv on disk.
+    reader = pd.read_csv(path, **read_kwargs)
+    return reader, lambda: None
 
 # The jamu species, each with the name variants actually seen in natural
 # product databases. Every variant maps back to one canonical label so the
@@ -116,54 +193,46 @@ def filter_bulk(
     species_map = species_map or JAMU_SPECIES
     patterns = _build_patterns(species_map)
 
-    with zipfile.ZipFile(zip_path) as archive:
-        if member is None:
-            names = [n for n in archive.namelist() if n.lower().endswith(".csv")]
-            if len(names) != 1:
-                raise ValueError(f"expected one CSV in the zip, found {names}")
-            member = names[0]
+    # zip_path may be a zip or an already unzipped csv; _bulk_reader handles both.
+    reader, close = _bulk_reader(
+        zip_path, member, chunksize, lambda c: c in KEEP_COLUMNS
+    )
 
-        kept_chunks = []
-        rows_seen = 0
-        chunk_index = 0
+    kept_chunks = []
+    rows_seen = 0
+    chunk_index = 0
 
-        with archive.open(member) as handle:
-            reader = pd.read_csv(
-                handle,
-                chunksize=chunksize,
-                usecols=lambda c: c in KEEP_COLUMNS,
-                dtype=str,
-                on_bad_lines="warn",
-                low_memory=False,
+    try:
+        for chunk in reader:
+            chunk_index += 1
+            rows_seen += len(chunk)
+
+            # Cheap prefilter before the regex work. Most of COCONUT has
+            # nothing to do with these six plants, so a plain substring
+            # test on the genus throws out the bulk of each chunk first.
+            genera = [v.split(" ")[0] for _c, v, _p in patterns]
+            genus_re = "|".join(sorted(set(re.escape(g) for g in genera)))
+            maybe = chunk["organisms"].fillna("").str.contains(
+                genus_re, case=False, regex=True
             )
-            for chunk in reader:
-                chunk_index += 1
-                rows_seen += len(chunk)
+            candidate = chunk[maybe]
 
-                # Cheap prefilter before the regex work. Most of COCONUT has
-                # nothing to do with these six plants, so a plain substring
-                # test on the genus throws out the bulk of each chunk first.
-                genera = [v.split(" ")[0] for _c, v, _p in patterns]
-                genus_re = "|".join(sorted(set(re.escape(g) for g in genera)))
-                maybe = chunk["organisms"].fillna("").str.contains(
-                    genus_re, case=False, regex=True
+            if len(candidate):
+                matched = candidate["organisms"].apply(
+                    lambda f: match_species(f, patterns)
                 )
-                candidate = chunk[maybe]
-
-                if len(candidate):
-                    matched = candidate["organisms"].apply(
-                        lambda f: match_species(f, patterns)
+                hit = candidate[matched.str.len() > 0].copy()
+                if len(hit):
+                    hit["matched_species"] = matched[matched.str.len() > 0].apply(
+                        lambda s: "|".join(s)
                     )
-                    hit = candidate[matched.str.len() > 0].copy()
-                    if len(hit):
-                        hit["matched_species"] = matched[matched.str.len() > 0].apply(
-                            lambda s: "|".join(s)
-                        )
-                        kept_chunks.append(hit)
+                    kept_chunks.append(hit)
 
-                if progress_every and chunk_index % progress_every == 0:
-                    found = sum(len(c) for c in kept_chunks)
-                    print(f"  {rows_seen:,} rows scanned, {found:,} kept")
+            if progress_every and chunk_index % progress_every == 0:
+                found = sum(len(c) for c in kept_chunks)
+                print(f"  {rows_seen:,} rows scanned, {found:,} kept")
+    finally:
+        close()
 
     if kept_chunks:
         out = pd.concat(kept_chunks, ignore_index=True)
@@ -240,3 +309,43 @@ if __name__ == "__main__":
     os.makedirs(os.path.dirname(os.path.abspath(args.out_csv)), exist_ok=True)
     compounds.to_csv(args.out_csv, index=False)
     print(f"\nwrote {args.out_csv}")
+
+
+def lookup_by_name(bulk_path, wanted_names, chunksize=50000):
+    # Pull specific compounds out of COCONUT by name.
+    #
+    # This exists so that reference compounds (positive controls, literature
+    # examples) come from the database like everything else. Typing a SMILES
+    # string in by hand produces a structure with no identifier and no
+    # provenance, which cannot be cited and cannot be checked.
+    #
+    # Matching is exact on the lowercased name, not a substring test: searching
+    # for "piperine" as a substring also returns piperidine alkaloids, which
+    # are different compounds entirely.
+    wanted = {str(n).strip().lower() for n in wanted_names}
+
+    reader, close = _bulk_reader(
+        bulk_path, None, chunksize, lambda c: c in KEEP_COLUMNS
+    )
+
+    hits = []
+    try:
+        for chunk in reader:
+            if "name" not in chunk.columns:
+                break
+            lowered = chunk["name"].fillna("").str.strip().str.lower()
+            found = chunk[lowered.isin(wanted)]
+            if len(found):
+                hits.append(found.copy())
+    finally:
+        close()
+
+    if not hits:
+        return pd.DataFrame(columns=KEEP_COLUMNS)
+
+    out = pd.concat(hits, ignore_index=True)
+    # One name can appear on several COCONUT entries (different stereochemistry
+    # or source records). Keep the first per name and say how many were merged.
+    out["_name_lower"] = out["name"].str.strip().str.lower()
+    out = out.drop_duplicates("_name_lower").drop(columns="_name_lower")
+    return out.reset_index(drop=True)

@@ -175,11 +175,19 @@ if fp is None:
 
 mol = Chem.MolFromSmiles(smiles.strip())
 
+# Two different representations of the same molecule, and they are not
+# interchangeable:
+#   fp   = fragment counts + descriptors, which is what Model A was trained on
+#   bits = plain 0/1 fingerprint, which is the only thing Tanimoto accepts
+# The domain was fitted on bits in notebook 02, so handing it fp would not even
+# line up on shape, let alone mean anything.
+bits = features.smiles_to_bits(smiles.strip())
+
 # The domain gate is checked BEFORE Model A runs, not after. Outside the domain
 # the tier is Unknown regardless, and a probability that the tier logic then
 # discards is exactly the number that ends up getting quoted anyway.
-domain_status = applicability.check_molecule(fp, bundle["domain"])
-domain_score = float(applicability.density_scores(fp, bundle["domain"])[0])
+domain_status = applicability.check_molecule(bits, bundle["domain"])
+domain_score = float(applicability.density_scores(bits, bundle["domain"])[0])
 
 if domain_status == applicability.OUTSIDE:
     cond1 = {"call": None, "prob": None, "source": "not run"}
