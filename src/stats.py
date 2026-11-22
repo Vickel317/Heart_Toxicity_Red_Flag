@@ -1,6 +1,12 @@
-# Is a substructure genuinely enriched among inhibitors, or did it turn up by chance?
-# SHAP says which bits the model leaned on. It does not say whether that
-# association is statistically real, which is what these tests are for.
+# "Is this fragment really linked to inhibition, or did it just come up by luck?"
+#
+# SHAP tells us which fragments the model leaned on. That is a fact about the
+# model, not about chemistry. The model could be leaning on something that
+# happens to correlate in our particular dataset by accident.
+#
+# So we check separately, straight from the labels and ignoring the model: among
+# molecules that HAVE this fragment, are inhibitors more common than among
+# molecules that do not? That is what the tests in here do.
 
 import numpy as np
 import pandas as pd
@@ -8,15 +14,21 @@ from scipy.stats import fisher_exact
 
 
 def motif_enrichment(motif_present, labels):
-    # One motif against one label column.
-    # Builds the 2x2 table and runs Fisher's exact test. Fisher rather than
-    # chi-squared because rare motifs give small cell counts, where the
-    # chi-squared approximation is not trustworthy.
+    # Test one fragment against the true labels.
     #
-    # Table orientation, which fixes what the odds ratio means:
-    #     [[motif present & label 1, motif present & label 0],
-    #      [motif absent  & label 1, motif absent  & label 0]]
-    # So an odds ratio above 1 means the motif is enriched among the positives.
+    # Builds a 2x2 count table and runs Fisher's exact test, which asks: if the
+    # fragment had nothing to do with inhibition, how unlikely is a split this
+    # lopsided? A small p-value means "unlikely to be luck".
+    #
+    # Fisher rather than chi-squared because rare fragments give tiny counts,
+    # and chi-squared stops being trustworthy when the counts get small.
+    #
+    # The table is laid out this way on purpose, because it decides which
+    # direction the odds ratio points:
+    #     [[has fragment & inhibitor, has fragment & not inhibitor],
+    #      [no  fragment & inhibitor, no  fragment & not inhibitor]]
+    # With that layout, odds ratio above 1 means the fragment is commoner among
+    # inhibitors, and below 1 means commoner among non-inhibitors.
     present = np.asarray(motif_present).astype(bool)
     y = np.asarray(labels).astype(bool)
     if present.shape[0] != y.shape[0]:
@@ -41,11 +53,13 @@ def motif_enrichment(motif_present, labels):
 
 
 def benjamini_hochberg(pvalues, alpha=0.05):
-    # Correct for testing many motifs at once.
-    # One test per fingerprint bit over 1024 bits would hand us roughly 50
-    # false hits at alpha 0.05 even if no motif mattered at all.
+    # Fix the problem of running thousands of tests at once.
     #
-    # Returns (adjusted p values in the original order, boolean significant mask).
+    # A p-value of 0.05 means "this would happen by luck 1 time in 20". Test
+    # 2,000 fragments and about 100 will clear that bar even if not one of them
+    # matters. This raises the bar depending on how many tests were run.
+    #
+    # Returns (adjusted p-values in the original order, True/False significant).
     p = np.asarray(pvalues, dtype=float)
     n = p.shape[0]
     if n == 0:
@@ -55,10 +69,11 @@ def benjamini_hochberg(pvalues, alpha=0.05):
     p_sorted = p[order]
     ranks = np.arange(1, n + 1, dtype=float)
 
-    # Raw BH scaling, then the step-up running minimum from the largest p
-    # downwards. Without that running minimum the "adjusted" values are not
-    # monotone, and a bit could come out with a smaller adjusted p than a bit
-    # with a smaller raw p.
+    # Scale each p-value by how many tests ran and where it ranks, then sweep
+    # backwards keeping the running minimum. Without that sweep the adjusted
+    # values can go out of order, so a fragment could end up with a smaller
+    # adjusted p than another fragment that had a smaller raw p. That would be
+    # nonsense, and it is the step people most often leave out.
     scaled = p_sorted * n / ranks
     adjusted_sorted = np.minimum.accumulate(scaled[::-1])[::-1]
     adjusted_sorted = np.clip(adjusted_sorted, 0.0, 1.0)
@@ -69,8 +84,8 @@ def benjamini_hochberg(pvalues, alpha=0.05):
 
 
 def enrichment_table(X, labels, bit_ids, alpha=0.05):
-    # Run the test for a list of bits and collect the results in one dataframe,
-    # sorted by adjusted p value.
+    # Test a whole list of fragments and put the results in one table, sorted
+    # with the most convincing first.
     X = np.asarray(X)
     y = np.asarray(labels)
     bit_ids = list(bit_ids)
@@ -91,9 +106,10 @@ def enrichment_table(X, labels, bit_ids, alpha=0.05):
     df["p_adjusted"] = adjusted
     df["significant"] = significant
 
-    # The correction was applied across exactly the bits tested here, so record
-    # that count. Testing 20 bits and testing 1024 give different adjusted
-    # values for the same raw p, and a reader needs to know which this was.
+    # Record how many tests the correction covered. Correcting across 20
+    # fragments and across 2,000 gives different answers for the same raw
+    # p-value, so a reader has to know which one this was. Quoting an adjusted
+    # p without saying how many tests it covers means nothing.
     df["n_tests"] = len(rows)
 
     columns = [

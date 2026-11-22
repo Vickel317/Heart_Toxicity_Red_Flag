@@ -1,16 +1,20 @@
-# Pull the compounds reported for a short list of Indonesian medicinal plants
-# out of the COCONUT 2.0 bulk download.
+# Get the jamu compounds.
 #
-# The bulk CSV is about 700 MB, so it is streamed in chunks straight out of the
-# zip rather than loaded whole. Reading it with plain pandas.read_csv on a
-# laptop is what makes this step feel impossible; chunked, it is a few minutes.
+# COCONUT is a free database of natural products: molecules found in living
+# things, with a record of which organism each one came from. We want the ones
+# reported from six Indonesian medicinal plants.
 #
-# Species naming is the real difficulty here, not the file size. COCONUT's
-# `organisms` field is a free text, pipe separated list contributed from many
-# source databases, so one plant appears under its accepted name, its synonyms,
-# and several spellings. Matching on the exact binomial alone silently loses
-# most of the rows, and a silent loss here looks like "this plant has no known
-# compounds", which is the wrong answer.
+# Problem 1, the easy one: the download is a ~700 MB spreadsheet. Loading it
+# all at once will exhaust memory on a laptop. So it is read in chunks, and
+# each chunk is filtered and thrown away before the next arrives. That turns an
+# impossible step into a few minutes.
+#
+# Problem 2, the one that actually matters: PLANT NAMES ARE A MESS. COCONUT's
+# organism field is free text contributed by many different databases, so one
+# plant shows up under its official name, its old names, and several spellings.
+# Search for only the exact official name and most rows vanish. And a row that
+# vanishes here looks exactly like "this plant has no known compounds", which
+# is a wrong answer that looks like a real one.
 
 import glob
 import os
@@ -19,11 +23,12 @@ import zipfile
 
 import pandas as pd
 
-# Where the bulk download might reasonably be sitting, relative to a notebook
-# in notebooks/. COCONUT reissues the file monthly and the release date is in
-# the name (coconut_csv-11-2026.csv for November 2026), so nothing here pins a
-# single filename: a pinned name breaks silently the moment a newer release is
-# downloaded. The file may be left zipped or unzipped, and either works.
+# Places the download might be sitting, as seen from a notebook in notebooks/.
+#
+# The filename has the release date in it (coconut_csv-11-2026.csv) because
+# COCONUT reissues the file every month. So we search by pattern instead of
+# hard coding a name: a hard coded name would break the moment anyone
+# downloaded a newer copy. Zipped or unzipped both work.
 BULK_SEARCH_DIRS = [
     os.path.join("..", "data", "coconut"),
     os.path.join("..", "data", "raw"),
@@ -41,10 +46,12 @@ DOWNLOAD_HINT = (
 
 
 def find_bulk(search_dirs=None):
-    # Locate the COCONUT bulk file without hard coding a release name.
-    # Raises with the download instructions rather than returning None, because
-    # a missing dataset should stop the notebook loudly, not produce an empty
-    # result that reads like "these plants have no compounds".
+    # Find whichever COCONUT file was downloaded.
+    #
+    # If there is none, this raises an error WITH the download link rather than
+    # returning None. That is deliberate: returning None would let the notebook
+    # carry on and produce an empty table, which reads like "these plants have
+    # no compounds" instead of "you forgot to download the file".
     search_dirs = search_dirs or BULK_SEARCH_DIRS
 
     found = []
@@ -55,17 +62,17 @@ def find_bulk(search_dirs=None):
     if not found:
         raise FileNotFoundError("No COCONUT bulk file found. " + DOWNLOAD_HINT)
 
-    # Sorting by name puts the newest release last, because the dates are in
-    # the filenames. Preferring the unzipped csv when both exist just avoids
-    # paying for decompression on every chunk.
+    # Sorting by name puts the newest release last, since the dates are in the
+    # filenames. If both a zip and an unzipped copy exist, prefer the unzipped
+    # one so we are not decompressing on every single chunk.
     found.sort()
     plain = [f for f in found if f.lower().endswith(".csv")]
     return (plain or found)[-1]
 
 
 def _bulk_reader(path, member, chunksize, usecols):
-    # Open the bulk file for chunked reading, whether it is a zip or a plain
-    # csv, and return (chunk iterator, cleanup callable).
+    # Open the file for chunk-by-chunk reading, handling both a zip and a
+    # plain csv. Returns (something to loop over, something to call when done).
     read_kwargs = dict(
         chunksize=chunksize,
         usecols=usecols,
@@ -94,14 +101,14 @@ def _bulk_reader(path, member, chunksize, usecols):
     reader = pd.read_csv(path, **read_kwargs)
     return reader, lambda: None
 
-# The jamu species, each with the name variants actually seen in natural
-# product databases. Every variant maps back to one canonical label so the
-# output can be grouped by plant.
+# The six plants, each with the name variants that actually turn up in these
+# databases. Every variant points back to one official name so the results can
+# be grouped per plant.
 #
-# These are synonyms and spelling variants of the SAME plant, not related
-# species. Phyllanthus amarus is deliberately NOT folded into P. niruri:
-# the two are frequently confused in the literature but they are different
-# species, so merging them would overstate what the data says.
+# Everything listed under one plant is the SAME plant written differently, not
+# a related plant. Phyllanthus amarus is deliberately NOT merged into
+# P. niruri: papers confuse the two constantly, but they are genuinely
+# different species, and merging them would claim more than the data supports.
 JAMU_SPECIES = {
     "Curcuma longa": [
         "curcuma longa",
@@ -130,8 +137,8 @@ JAMU_SPECIES = {
     ],
 }
 
-# Columns kept from the bulk file. The rest of COCONUT's 44 columns are not
-# needed downstream and dropping them early keeps the chunks small.
+# Which columns to keep. COCONUT has 44; we need nine. Dropping the rest as
+# early as possible is what keeps each chunk small enough to handle.
 KEEP_COLUMNS = [
     "identifier",
     "canonical_smiles",
@@ -148,12 +155,13 @@ _SPACES = re.compile(r"\s+")
 
 
 def _build_patterns(species_map):
-    # One compiled word-boundary regex per variant.
+    # Build one search pattern per name variant.
     #
-    # Word boundaries matter: a bare substring test for "curcuma longa" would
-    # also hit "Curcuma longaeflora" if such a name appeared. \b after the
-    # final token prevents that, while still allowing the authority suffixes
-    # that databases append, as in "Curcuma longa L." or "... Roscoe".
+    # The \b parts mean "must be a whole word". Without them, searching for
+    # "curcuma longa" would also match "Curcuma longaeflora", a different
+    # plant. With them we still match "Curcuma longa L." and "Curcuma longa
+    # Roscoe", which is what we want, because databases tack the name of the
+    # botanist who classified the plant onto the end.
     patterns = []
     for canonical, variants in species_map.items():
         for variant in variants:
@@ -167,8 +175,8 @@ def _normalise_organism(text):
 
 
 def match_species(organisms_field, patterns):
-    # Which of our species does one row's organisms field mention?
-    # Returns a sorted list of canonical species names, empty if none.
+    # Does this row's organism text mention any of our six plants?
+    # Returns the official names of the ones it matched, empty list if none.
     if organisms_field is None or pd.isna(organisms_field):
         return []
     text = _normalise_organism(organisms_field)
@@ -188,8 +196,8 @@ def filter_bulk(
     chunksize=50000,
     progress_every=20,
 ):
-    # Stream the COCONUT bulk CSV and keep only rows mentioning our species.
-    # Returns (filtered DataFrame, stats dict).
+    # Read the whole COCONUT file in chunks, keeping only rows that mention
+    # one of our plants. Returns (the kept rows, some counts).
     species_map = species_map or JAMU_SPECIES
     patterns = _build_patterns(species_map)
 
@@ -207,9 +215,11 @@ def filter_bulk(
             chunk_index += 1
             rows_seen += len(chunk)
 
-            # Cheap prefilter before the regex work. Most of COCONUT has
-            # nothing to do with these six plants, so a plain substring
-            # test on the genus throws out the bulk of each chunk first.
+            # Quick cheap check before the careful slow one. Almost none of
+            # COCONUT has anything to do with these six plants, so first do a
+            # rough test on just the genus ("curcuma", "zingiber"), which
+            # throws away most of the chunk. Only the survivors get the
+            # careful whole-word matching, which is much slower.
             genera = [v.split(" ")[0] for _c, v, _p in patterns]
             genus_re = "|".join(sorted(set(re.escape(g) for g in genera)))
             maybe = chunk["organisms"].fillna("").str.contains(
@@ -239,10 +249,10 @@ def filter_bulk(
     else:
         out = pd.DataFrame(columns=KEEP_COLUMNS + ["matched_species"])
 
-    # One compound can be reported from several of these plants, which is a
-    # real finding rather than a duplicate. The rows are collapsed on the
-    # COCONUT identifier and the species are merged into one field, so each
-    # compound is scored once but its plant list is preserved.
+    # The same compound can be reported from several of these plants. That is
+    # a real fact, not a duplicate row to delete. So rows are merged on the
+    # compound's ID and the plant names joined together: each compound gets
+    # scored once, but we still know every plant it came from.
     stats = {"rows_scanned": rows_seen, "rows_matched": len(out)}
     if len(out):
         out = _collapse_duplicates(out)
@@ -252,10 +262,10 @@ def filter_bulk(
 
 
 def fill_missing_names(df):
-    # A third of COCONUT's natural products have no trivial name, only an
-    # identifier. Left as NaN they would print as "nan" in the screening output
-    # and in the demo app, which reads as a broken row rather than as a real
-    # compound that simply has not been named.
+    # About a third of these compounds have no common name, only an ID code.
+    # Left empty they print as "nan" in the results, which looks like a bug.
+    # Using the ID code instead makes it clear the compound is real and simply
+    # has never been given a name.
     df = df.copy()
     missing = df["name"].isna() | (df["name"].astype(str).str.strip() == "")
     df.loc[missing, "name"] = df.loc[missing, "identifier"].astype(str)
@@ -276,8 +286,8 @@ def _collapse_duplicates(df):
 
 
 def species_counts(df):
-    # How many compounds came from each plant. Compounds shared between plants
-    # are counted under each, so the total exceeds the number of rows.
+    # Count compounds per plant. A compound found in two plants is counted
+    # under both, so these numbers add up to more than the number of rows.
     counts = {}
     for value in df["matched_species"]:
         for species in str(value).split("|"):
@@ -312,16 +322,16 @@ if __name__ == "__main__":
 
 
 def lookup_by_name(bulk_path, wanted_names, chunksize=50000):
-    # Pull specific compounds out of COCONUT by name.
+    # Look up specific compounds by name.
     #
-    # This exists so that reference compounds (positive controls, literature
-    # examples) come from the database like everything else. Typing a SMILES
-    # string in by hand produces a structure with no identifier and no
-    # provenance, which cannot be cited and cannot be checked.
+    # This exists so that reference compounds come from the database like
+    # everything else does. Typing a structure in by hand gives something with
+    # no ID and no source, which cannot be cited and cannot be checked by
+    # anyone else.
     #
-    # Matching is exact on the lowercased name, not a substring test: searching
-    # for "piperine" as a substring also returns piperidine alkaloids, which
-    # are different compounds entirely.
+    # The match is exact on the lowercased name, not "contains". Searching for
+    # "piperine" as a substring would also drag in piperidine alkaloids, which
+    # are completely different compounds.
     wanted = {str(n).strip().lower() for n in wanted_names}
 
     reader, close = _bulk_reader(

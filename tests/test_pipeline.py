@@ -295,6 +295,33 @@ def c3_list():
             "source": combine.SOURCE_QT_LIST, "risk_category": "known risk"}
 
 
+def test_lookups_from_panel():
+    # Both drug-side lookups come from one table, so the substrate leg covers
+    # every drug in the panel while the hERG leg covers only the measured ones.
+    panel = pd.DataFrame({
+        "name": ["amiodarone", "midazolam", "ibuprofen"],
+        "strength": ["measured substrate"] * 3,
+        "herg_measured": [True, False, False],
+    })
+    substrates, herg = combine.lookups_from_panel(panel)
+
+    assert len(substrates) == 3
+    assert len(herg) == 1
+    assert combine.drug_is_cyp3a4_substrate("Midazolam", substrates)["call"] == combine.SUBSTRATE
+
+    # A measured blocker is a firm yes from the list, with no model probability.
+    measured = combine.drug_blocks_herg("amiodarone", None, None, herg)
+    assert measured["call"] == combine.YES
+    assert measured["source"] == combine.SOURCE_QT_LIST
+    assert measured["prob"] is None
+
+    # A panel drug with no hERG measurement falls through to Model B, which is
+    # absent here, so it reports unavailable rather than guessing.
+    unmeasured = combine.drug_blocks_herg("midazolam", None, None, herg)
+    assert unmeasured["source"] == "unavailable"
+    print("  one panel table yields both drug-side lookups OK")
+
+
 def test_tier_domain_gate_wins():
     # Everything says yes, but the molecule is outside the domain.
     tier = combine.assign_tier(
@@ -358,6 +385,27 @@ def test_tier_not_flagged():
     )
     assert tier2 == combine.NOT_FLAGGED
     print("  not flagged when fewer than two legs hold OK")
+
+
+def test_tier_refuted_leg_breaks_the_chain():
+    # A measured hERG non-blocker, paired with a confidently predicted
+    # inhibitor and a real substrate record. Two legs hold, but the third is
+    # refuted rather than merely missing, so the chain is broken and nothing
+    # should be reported. Contrast with test_tier_medium_two_of_three, where
+    # the third leg is "not in table", a gap in the source rather than a no.
+    tier = combine.assign_tier(
+        c1(combine.YES, 0.95), c2(combine.SUBSTRATE), c3_model(combine.NO, 0.02),
+        applicability.INSIDE,
+    )
+    assert tier == combine.NOT_FLAGGED, tier
+
+    # Same shape on the substrate leg: a drug measured as a non-substrate.
+    tier2 = combine.assign_tier(
+        c1(combine.YES, 0.95), c2(combine.NOT_SUBSTRATE), c3_list(),
+        applicability.INSIDE,
+    )
+    assert tier2 == combine.NOT_FLAGGED, tier2
+    print("  a refuted leg breaks the chain, no Medium by two-of-three OK")
 
 
 def test_tier_lookup_has_no_weak_form():

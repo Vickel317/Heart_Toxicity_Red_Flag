@@ -4,34 +4,67 @@ Computational biology course project.
 
 ## Status
 
+Every notebook runs end to end with no errors, and the screen is complete.
+
 | Part | State |
 | --- | --- |
-| `src/features.py` fingerprints | implemented |
-| `src/models.py` Random Forest | implemented |
+| `src/features.py` 2048 Morgan counts + 10 descriptors | implemented |
+| `src/models.py` gradient boosting (A) and random forest (B) | implemented |
 | `src/applicability.py` domain gate | implemented, tested |
 | `src/stats.py` Fisher + Benjamini-Hochberg | implemented, tested (BH checked against SciPy) |
 | `src/names.py` drug name matching | implemented, tested |
 | `src/combine.py` three conditions and tiers | implemented, tested |
-| `src/coconut.py` COCONUT species filter | implemented, **run**: 1,861 compounds from 6 plants |
-| `src/explain.py` SHAP + bit to substructure | implemented, not yet executed (needs RDKit) |
-| Notebooks 01-06 | real code throughout, not yet executed |
-| `app/streamlit_app.py` | wired to the pipeline, needs the notebook artefacts |
-| Lookup tables (FDA, CredibleMeds) | **blocked on two manual downloads** |
+| `src/coconut.py` COCONUT species filter | **run**: 1,861 compounds from 6 plants |
+| `src/explain.py` SHAP + bit to substructure | **run**: additivity error 3.6e-13 |
+| Notebooks 01-06 | all execute clean |
+| `app/streamlit_app.py` | wired to the pipeline |
 
-`python tests/test_pipeline.py` runs 31 tests over everything that does not need
-RDKit. All pass.
+`python -m pytest -q` runs 33 tests. All pass.
 
-### What is still needed
+### Results
 
-1. **`data/raw/fda_cyp3a4_substrates.csv`** - columns `name`, `strength`. From the
-   [FDA drug interactions table](https://www.fda.gov/drugs/drug-interactions-labeling/drug-development-and-drug-interactions-table-substrates-inhibitors-and-inducers).
-   Public, no login.
-2. **`data/raw/credible_meds_qt.csv`** - columns `name`, `risk_category`. From the
-   [CredibleMeds QTdrugs list](https://crediblemeds.org/druglist). **Free
-   registration required, so start this early.**
+| Measure | Value | Target |
+| --- | --- | --- |
+| Model A, random split ROC-AUC | 0.913 | - |
+| Model A, **scaffold split** ROC-AUC | **0.802** | 0.80 |
+| Model B, scaffold-grouped CV ROC-AUC | **0.869 +/- 0.033** | 0.85 |
+| Jamu compounds outside Model A's domain | 45.8% (852 of 1,861) | reported, not hidden |
+| Held-out drugs outside the same domain | 4.7% | - |
+| Jamu compounds reaching High tier | 117 | - |
 
-Notebook 05 writes blank templates with the right headers if the files are absent,
-and refuses to continue rather than screening against an empty table.
+Top hits are Hinokinin (0.979, *Phyllanthus niruri*) and rac-Cubebin (0.976,
+*Zingiber officinale*), both dibenzylbutyrolactone lignans, and in both cases the
+largest positive SHAP contribution falls on the fused aromatic/5-ring oxygenated
+system rather than on the periphery.
+
+**The positive controls did not validate the screen.** Of five literature CYP3A4
+reference compounds, only two are in COCONUT under the searched name: quercetin
+scores 0.106, a miss against its documented in vitro inhibition, and
+andrographolide falls outside the applicability domain and is correctly reported
+as Unknown. Piperine, bergamottin and curcumin are absent under those names, so
+they were never scored. The screen therefore has no working positive control, and
+the ranked hits above should be read as untested hypotheses.
+
+### Data, all downloaded automatically
+
+Notebook 01 pulls four files from Harvard Dataverse; COCONUT is the only manual
+download. Nothing is hand-typed and nothing needs a registration.
+
+| Dataset | Used for |
+| --- | --- |
+| `CYP3A4_Veith` | Model A training, condition 1 |
+| `CYP3A4_Substrate_CarbonMangels` | condition 2, measured substrate labels |
+| `hERG` | Model B training and condition 3 |
+| [COCONUT 2.0](https://coconut.naturalproducts.net/download) | the jamu compounds (manual, ~240 MB zip into `data/raw/`) |
+
+The FDA substrate table and the CredibleMeds QTdrugs list were the original plan
+for conditions 2 and 3. Neither is usable as a dataset: the FDA page is HTML whose
+CYP3A row lists only midazolam and triazolam, which are *index* substrates for
+designing interaction studies rather than a substrate list, and CredibleMeds puts
+bulk download behind a commercial licence. Notebook 05 explains the substitution
+and what it costs: the hERG label is in vitro channel blockade, not clinical
+torsades risk, so the output is a mechanistic hypothesis list rather than a
+clinical risk list.
 
 ## The question
 
@@ -99,11 +132,11 @@ jupyter lab
 
 Run the notebooks in order:
 
-1. `notebooks/01_data_loading.ipynb` loads both TDC datasets and builds fingerprints.
+1. `notebooks/01_data_loading.ipynb` downloads the three TDC datasets and builds fingerprints.
 2. `notebooks/02_model_a_cyp3a4.ipynb` trains Model A, runs a random **and** a scaffold split, fits the applicability domain.
 3. `notebooks/03_model_b_herg.ipynb` cross validates Model B over 5 folds, plus a scaffold split, then fits the final model.
 4. `notebooks/04_shap_analysis.ipynb` SHAP, bit to substructure mapping, Fisher test with BH correction, known-pharmacology check.
-5. `notebooks/05_lookup_tables.ipynb` CredibleMeds QT list intersected with the FDA CYP3A4 substrate table.
+5. `notebooks/05_lookup_tables.ipynb` builds the 342-drug panel: measured CYP3A4 substrates, with condition 3 from measured hERG blockade where it exists and Model B elsewhere.
 6. `notebooks/06_herbal_screening.ipynb` COCONUT filtering, applicability domain, tiers.
 
 Notebooks 02 and 03 must run before 04, 06 and the app, because they write the
@@ -112,7 +145,7 @@ model and domain files everything else loads.
 Tests:
 
 ```bash
-python tests/test_pipeline.py
+python -m pytest -q
 ```
 
 Demo app:

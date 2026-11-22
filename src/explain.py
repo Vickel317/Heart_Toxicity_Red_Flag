@@ -1,6 +1,16 @@
-# SHAP explanations, and mapping fingerprint bits back to real chemistry.
-# A bit index on its own tells a reader nothing. The point of this module is to
-# turn "bit 807 mattered" into "this aromatic ring with a basic nitrogen mattered".
+# WHY did the model give this molecule that score?
+#
+# A prediction on its own is not science. "0.97" is not a finding. "This ring
+# is why it scored 0.97" is. This file turns the first into the second.
+#
+# It uses SHAP, which breaks one prediction into one number per feature: how
+# much did this feature push the score up or down, for THIS molecule. Those
+# numbers are called phi. Positive phi pushed towards "jams the enzyme",
+# negative phi pushed away from it.
+#
+# But SHAP answers in fingerprint box numbers, and "box 1536 mattered" means
+# nothing to a human. So the other job of this file is working backwards from a
+# box number to the actual atoms that ticked it, and drawing them.
 
 import numpy as np
 from rdkit import Chem
@@ -11,11 +21,12 @@ import features
 
 
 def _positive_class_shap(values):
-    # SHAP's output layout for a binary classifier changed between versions.
-    # Older releases return a list [negative_class_array, positive_class_array].
-    # Newer ones return a single array shaped (n_rows, n_features, n_classes).
-    # Guessing wrong silently explains the WRONG class, which looks like a
-    # working result, so the shape is checked rather than assumed.
+    # Pull out the numbers for the class we care about ("yes, it jams it").
+    #
+    # Different SHAP versions return this in different shapes. Old ones give a
+    # list [no-numbers, yes-numbers]; new ones give one block with the class on
+    # the end. Guessing wrong explains the OPPOSITE class and still looks like
+    # a working result, so the shape is checked instead of assumed.
     if isinstance(values, list):
         if len(values) == 2:
             return np.asarray(values[1])
@@ -33,21 +44,20 @@ def _positive_class_shap(values):
 
 
 def shap_matrix(model, X):
-    # Run SHAP once and hand back the positive class contributions.
+    # Run SHAP and get one number per feature, per molecule.
     #
-    # TreeExplainer is exact for tree models, not an approximation, which is why
-    # a tree model was worth keeping over something less interpretable.
+    # For tree models SHAP is exact, not an estimate. That is a big reason the
+    # project stayed with trees instead of something harder to explain.
     #
-    # The try/except is not defensive padding, it handles a real failure:
-    # on a random forest grown on 12k molecules, SHAP's own additivity check
-    # raises outright. The check asks whether
+    # The try/except handles a real failure, not an imagined one. SHAP checks
+    # its own work by asking:
     #
-    #     base value + sum of contributions == the model's own prediction
+    #     starting point + all the pushes == the model's actual answer?
     #
-    # and on a deep forest over a wide float32 matrix the two sides drift apart
-    # by rounding alone, even though the contributions are perfectly usable.
-    # Rather than crash or silently ignore it, we retry without the check and
-    # point the reader at audit_additivity(), which measures the real error.
+    # On a big random forest the two sides end up slightly apart from rounding
+    # alone, and SHAP refuses rather than returning anything at all. The numbers
+    # are still fine, so we retry with the check off and point at
+    # audit_additivity below, which measures how far off it really was.
     import shap
 
     X = np.asarray(X)
@@ -63,13 +73,12 @@ def shap_matrix(model, X):
 
 
 def audit_additivity(model, X):
-    # How well do the SHAP values actually add up?
+    # Check the explanations ourselves: do the pushes add back up to the answer?
     #
-    # SHAP's promise is that base value + sum of contributions reproduces the
-    # model's own output for each molecule. If that holds to a small number, the
-    # explanation is faithful whatever the library's internal check decided.
-    # Returns the worst and average gap, in probability units: anything near
-    # 1e-6 is exact to floating point precision.
+    # If starting point + all the pushes returns the model's own output, the
+    # explanation is faithful, whatever SHAP's built-in check decided. Returns
+    # the worst and the average gap. Anything near 1e-6 or below is as exact as
+    # floating point arithmetic gets. Ours comes out around 1e-13.
     import shap
 
     X = np.asarray(X)
@@ -79,11 +88,13 @@ def audit_additivity(model, X):
     base = np.asarray(explainer.expected_value).ravel()
     base = float(base[-1]) if base.size >= 2 else float(base[0])
 
-    # Which scale are the contributions on? This is easy to get wrong and the
-    # mistake is loud: gradient boosting hands back LOG-ODDS (the raw margin),
-    # while a random forest hands back probabilities. Comparing log-odds against
-    # predict_proba gives errors of several whole units and makes a perfectly
-    # faithful explanation look broken.
+    # What units are the pushes in? Easy to get wrong, and the mistake is loud.
+    #
+    # Gradient boosting explains in log-odds (its raw internal score), while a
+    # random forest explains in probabilities. Compare log-odds against a
+    # probability and the gap comes out as whole units, making a perfectly good
+    # explanation look broken. That exact mistake happened here: the error read
+    # 8.64 until this check was added, then dropped to 3.55e-13.
     if hasattr(model, "decision_function"):
         actual = model.decision_function(X)
         scale = "log-odds"
@@ -99,15 +110,16 @@ def audit_additivity(model, X):
 
 
 def explain_model(model, X, top_n=25, fingerprint_only=True):
-    # Rank which features drive the model's positive predictions.
-    # Returns (top indices, their mean absolute SHAP values, the full positive
-    # class SHAP matrix) so the caller can also draw a summary plot.
+    # Which features matter most to the model overall?
     #
-    # fingerprint_only keeps the ranking to the Morgan columns, because those
-    # are the ones bit_to_atoms() can turn back into pictures of chemistry. The
-    # ten descriptors live in the columns after them and are ranked separately
-    # by top_descriptors() below; mixing them in would hand bit_to_atoms an
-    # index such as 2051 ("MolLogP") that corresponds to no fragment at all.
+    # Ranked by average size of push, ignoring direction, so a feature that
+    # pushes some molecules up and others down still ranks high.
+    #
+    # fingerprint_only sticks to the fragment boxes, because those are the ones
+    # we can turn back into pictures. The ten whole-molecule numbers sit in the
+    # columns after them and are ranked separately by top_descriptors below.
+    # Mixing them in would hand the fragment-drawing code an index like 2051
+    # (which is "MolLogP"), and that is not a fragment, so it cannot be drawn.
     shap_values = shap_matrix(model, X)
 
     mean_abs = np.abs(shap_values).mean(axis=0)
@@ -119,20 +131,20 @@ def explain_model(model, X, top_n=25, fingerprint_only=True):
 
 
 def top_descriptors(shap_values, X=None):
-    # The ten whole-molecule descriptors, ranked, with their direction.
+    # Rank the ten whole-molecule numbers, and say which way each one points.
     #
-    # Worth reading separately from the bits: the bits say which PIECES of a
-    # molecule matter, the descriptors say what KIND of molecule matters. If
-    # size and greasiness rank high for Model A, that matches what is known
-    # about CYP3A4's large hydrophobic pocket, which is a sign the model learned
-    # chemistry rather than memorising the training set.
+    # Read these separately from the fragments. Fragments say which PIECES of a
+    # molecule matter; these say what KIND of molecule matters. When size and
+    # greasiness come out on top for Model A, that matches the known fact that
+    # CYP3A4 has a big greasy pocket, which is evidence the model learned real
+    # chemistry instead of memorising its training set.
     #
-    # Direction is read as the CORRELATION between a descriptor's value and its
-    # SHAP contribution, not from the sign of the mean contribution. The mean
-    # sign answers the wrong question: it describes the particular molecules in
-    # this sample, so a sample of mostly small molecules makes MolWt look like a
-    # "protective" feature. The correlation answers the question actually being
-    # asked, which is "as this descriptor goes UP, does predicted risk go up?".
+    # Direction comes from CORRELATION, not from the average push. That is a
+    # real bug we hit. The average push describes whichever molecules happen to
+    # be in this sample, so a sample of mostly small molecules made MolWt look
+    # protective. Correlation answers what we actually mean: "when this number
+    # goes UP, does predicted risk go up?" After the fix MolLogP reads r =
+    # +0.85, higher raises risk, which is the correct direction.
     shap_values = np.asarray(shap_values)
     if shap_values.shape[1] <= features.FP_SIZE:
         return []
@@ -162,17 +174,24 @@ def top_descriptors(shap_values, X=None):
 
 
 def bit_to_atoms(smiles, bit_ids):
-    # For one molecule, find which atoms each requested bit came from.
-    # Returns {bit id: [atom indices]}, with bits absent from this molecule
-    # simply left out.
+    # Work backwards: which atoms in this molecule ticked box 1536?
+    #
+    # This is the step that makes the whole SHAP analysis readable. Without it
+    # the result is "box 1536 matters" and nobody can act on that. With it the
+    # result is "this specific ring matters", which can be drawn and checked
+    # against known chemistry.
+    #
+    # Returns {box number: [atom positions]}. Boxes this molecule does not have
+    # are simply left out.
     mol = Chem.MolFromSmiles(smiles)
     if mol is None:
         return {}
 
-    # The shared generator from features.py is reused so the bit numbering
-    # matches the training data exactly. A second generator built with the same
-    # arguments would be fine today, but it is one edit away from silently
-    # renumbering every bit, which would make every explanation wrong.
+    # Ask RDKit to record which atoms set which box while it builds the
+    # fingerprint. Note it reuses the SAME generator object as features.py.
+    # Building a second one with identical settings would work today, but one
+    # edit to either copy would renumber every box, and then every explanation
+    # would quietly be about the wrong fragment.
     ao = rdFingerprintGenerator.AdditionalOutput()
     ao.AllocateBitInfoMap()
     features.MORGAN_GEN.GetFingerprint(mol, additionalOutput=ao)
@@ -193,18 +212,21 @@ def bit_to_atoms(smiles, bit_ids):
                 bond = mol.GetBondWithIdx(bond_idx)
                 atoms.add(bond.GetBeginAtomIdx())
                 atoms.add(bond.GetEndAtomIdx())
-            # A radius with no bonds in its environment still centres on an atom.
+            # Even when the neighbourhood contains no bonds, it still sits on
+            # a centre atom, so add that.
             atoms.add(int(centre))
         out[bit] = sorted(atoms)
     return out
 
 
 def describe_fragment(mol, atom_ids):
-    # Plain language description of one fragment, for the report and the demo app.
+    # Describe a fragment in words, for the tables and the demo app.
     #
-    # The chemistry flags are read straight off the PARENT molecule atoms that
-    # atom_ids points at. RDKit already computed aromaticity, ring membership
-    # and valence when it parsed the whole molecule.
+    # The facts are read off the atoms in the WHOLE molecule, not off a copy of
+    # the fragment cut out on its own. That matters: cutting a ring fragment
+    # out leaves dangling bonds, and RDKit would then report it as not aromatic
+    # when in the real molecule it is. Reading from the parent avoids inventing
+    # a chemistry mistake.
     #
     # The fragment is NOT written out as a SMILES string and re-parsed with
     # Chem.MolFromSmiles. A fragment such as "ccc" is not valid standalone
@@ -345,8 +367,19 @@ def top_bit_examples(smiles_list, labels, bit_ids, X, n_examples=3):
 
 
 def atom_contributions(smiles, shap_row):
-    # Spread the fingerprint part of one molecule's SHAP row over its atoms.
-    # Returns (mol, per-atom score array), or (None, None) if parsing fails.
+    # Turn per-FRAGMENT pushes into per-ATOM pushes, so they can be coloured
+    # onto a picture of the molecule.
+    #
+    # The problem: SHAP gives one number per fragment box, but fragments
+    # overlap. One atom can belong to five different boxes at once. So each
+    # box's push is split evenly over the atoms that produced it, and the atoms
+    # add up whatever lands on them. An atom sitting inside several
+    # risk-raising fragments ends up hot.
+    #
+    # This is a reasonable way to share the credit, not the only one. It is
+    # also what makes the red/green molecule pictures possible.
+    #
+    # Returns (molecule, one score per atom), or (None, None) if parsing fails.
     mol = Chem.MolFromSmiles(smiles)
     if mol is None:
         return None, None
@@ -367,8 +400,8 @@ def atom_contributions(smiles, shap_row):
         if value == 0.0:
             continue
 
-        # Collect every atom this bit was computed from, across all the
-        # environments that hashed to it.
+        # Gather every atom that contributed to this box. One box can be
+        # ticked by several places in the same molecule, so collect them all.
         atoms = set()
         for centre, radius in environments:
             if radius == 0:
@@ -408,11 +441,11 @@ def draw_atom_heatmap(mol, atom_scores, size=(420, 380), as_svg=True):
 
 
 def explain_molecule(model, smiles, top_n=5):
-    # The reusable entry point: one SMILES in, a full explanation out.
+    # The main entry point: one molecule in, a full explanation out.
     #
-    # This is what the demo app and the jamu comparison both call. It answers,
-    # for a single molecule: how risky does the model think this is, which parts
-    # drive that upwards, and which parts pull it back down.
+    # This is what the demo app and the jamu comparison both call. For a single
+    # molecule it answers three things at once: how risky does the model think
+    # this is, which parts push that up, and which parts pull it back down.
     row = features.smiles_to_fp(smiles)
     if row is None:
         return None
@@ -423,9 +456,13 @@ def explain_molecule(model, smiles, top_n=5):
 
     mol, atom_scores = atom_contributions(smiles, shap_row)
 
-    # Rank only the bits this molecule actually contains. A bit it does not
-    # contain can still carry a SHAP value (absence is informative to the
-    # model), but it cannot be drawn on the structure.
+    # Only rank boxes this molecule actually has.
+    #
+    # A box the molecule does NOT have can still carry a SHAP number, because
+    # the model finds a missing fragment informative too. That is real, but it
+    # cannot be drawn on a picture of the structure, and reporting "this absent
+    # fragment is a risk driver" reads as nonsense. So absences are left out
+    # here.
     present = np.flatnonzero(np.asarray(row)[:features.FP_SIZE] > 0)
     ranked = sorted(present, key=lambda b: abs(shap_row[b]), reverse=True)
 

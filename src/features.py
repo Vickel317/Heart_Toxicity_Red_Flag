@@ -1,79 +1,84 @@
-# Turn SMILES strings into the numbers the models learn from.
-# These features are the only thing the models ever see, so everything downstream
-# (SHAP, applicability domain, bit to substructure mapping) uses this same setup.
+# Turn a molecule into numbers, because models cannot read chemistry.
+#
+# A molecule arrives as a SMILES string, which is just text: "CCO" is ethanol.
+# A model cannot learn from text, so every molecule has to become a fixed-length
+# list of numbers first. This file does that, and nothing else in the project
+# does it, so every part of the pipeline sees molecules the same way.
 #
 # Each molecule becomes N_FEATURES numbers, in two blocks:
 #
-#   columns 0 .. FP_SIZE-1        Morgan fingerprint COUNTS
-#                                 how many times each chemical fragment occurs
-#   columns FP_SIZE .. N_FEATURES-1   ten whole-molecule descriptors
-#                                 size, greasiness, polarity, flexibility
+#   columns 0 .. FP_SIZE-1    how many times each small fragment appears
+#   the last ten columns      ten facts about the whole molecule
 #
-# Why counts instead of plain 0/1 bits:
-#   a molecule with six aromatic rings and a molecule with one ring set exactly
-#   the same bit, but they do not behave the same way in the liver. Counting
-#   keeps that difference instead of throwing it away.
+# The first block is a "Morgan fingerprint". The idea: walk over every atom,
+# look at the little neighbourhood around it, and tick a box for each distinct
+# neighbourhood you find. Molecules that share fragments tick the same boxes.
 #
-# Why the ten descriptors:
-#   CYP3A4 has an unusually large, greasy binding pocket, so whether a molecule
-#   fits is partly a question about the WHOLE molecule (how big, how greasy).
-#   No single fragment bit can express that.
+# Why count the fragments instead of just ticking yes/no:
+#   one aromatic ring and six aromatic rings tick the same box, but they do not
+#   behave the same way in the liver. Counting keeps that difference.
 #
-# Both choices were measured on a validation split before being adopted. On a
-# scaffold split of CYP3A4_Veith they moved Model A from 0.760 to 0.802 ROC-AUC,
-# which was the difference between missing and meeting the 0.80 target.
+# Why the extra ten columns:
+#   CYP3A4 (the liver enzyme) has a big greasy pocket, so whether a molecule
+#   fits is partly about the whole molecule, not its pieces. "How heavy is it"
+#   is not something any single fragment box can say.
 #
-# IMPORTANT, and the reason smiles_to_bits() exists further down:
-#   Tanimoto similarity is only defined for SETS of bits, so the applicability
-#   domain must never be fed this matrix. Counts are not 0/1, and molecular
-#   weight is on a scale of hundreds, so it would swamp everything else and the
-#   similarity floor would come out as 0.0 (meaning nothing is ever rejected).
+# Both choices were tested, not guessed. They moved Model A from 0.760 to 0.802
+# ROC-AUC, which was the difference between missing and hitting the 0.80 target.
+#
+# ONE TRAP, and the reason smiles_to_bits() exists below:
+#   the applicability domain compares molecules with Tanimoto similarity, which
+#   only works on yes/no boxes. Feed it this matrix and it breaks twice over:
+#   the counts are not 0/1, and molecular weight is in the hundreds so it drowns
+#   out everything else. The symptom is a similarity floor of 0.0, meaning no
+#   molecule is ever rejected. Use smiles_to_bits for that, always.
 
 import numpy as np
 from rdkit import Chem
 from rdkit.Chem import Descriptors, rdFingerprintGenerator
 
-# radius 2 is the usual ECFP4 style setting for this kind of task.
-# 2048 rather than 1024 bits: twice the room means fewer unrelated fragments
-# colliding onto the same column, which SHAP would then be unable to tell apart.
+# radius 2 = look two bonds out from each atom. This is the standard setting.
+# 2048 boxes rather than 1024: with more boxes, fewer unrelated fragments get
+# squashed into the same one, which would leave SHAP unable to tell them apart.
 FP_SIZE = 2048
 FP_RADIUS = 2
 
-# One generator, built once at import time, reused for every molecule.
-# explain.py needs this exact object to read the bit info map, so it is shared.
+# Built once when this file is imported, then reused for every molecule.
+# explain.py needs this exact object to ask "which atoms set box 1536?", so it
+# is shared rather than rebuilt.
 MORGAN_GEN = rdFingerprintGenerator.GetMorganGenerator(radius=FP_RADIUS, fpSize=FP_SIZE)
 
-# Ten cheap, interpretable whole-molecule properties. Each is a plain number,
-# so SHAP can report "MolLogP pushed this prediction up" in notebook 04.
+# Ten plain facts about the whole molecule. Each is one number, so SHAP can say
+# "MolLogP is what pushed this prediction up" in notebook 04.
 DESCRIPTORS = [
     ("MolWt", Descriptors.MolWt),                          # how heavy
     ("MolLogP", Descriptors.MolLogP),                      # how greasy
-    ("TPSA", Descriptors.TPSA),                            # polar surface area
-    ("NumHDonors", Descriptors.NumHDonors),
-    ("NumHAcceptors", Descriptors.NumHAcceptors),
+    ("TPSA", Descriptors.TPSA),                            # how much polar surface
+    ("NumHDonors", Descriptors.NumHDonors),                # can donate H bonds
+    ("NumHAcceptors", Descriptors.NumHAcceptors),          # can accept H bonds
     ("NumRotatableBonds", Descriptors.NumRotatableBonds),  # how floppy
-    ("RingCount", Descriptors.RingCount),
+    ("RingCount", Descriptors.RingCount),                  # how many rings
     ("FractionCSP3", Descriptors.FractionCSP3),            # how 3D rather than flat
-    ("HeavyAtomCount", Descriptors.HeavyAtomCount),
-    ("NumAromaticRings", Descriptors.NumAromaticRings),
+    ("HeavyAtomCount", Descriptors.HeavyAtomCount),        # atoms, ignoring hydrogens
+    ("NumAromaticRings", Descriptors.NumAromaticRings),    # how many flat rings
 ]
 
 N_DESCRIPTORS = len(DESCRIPTORS)
 N_FEATURES = FP_SIZE + N_DESCRIPTORS
 
-# Readable column names, so a SHAP table says "MolLogP" rather than "feature 2049".
+# Column names, so a SHAP table says "MolLogP" and not "feature 2049".
 FEATURE_NAMES = [f"bit_{i}" for i in range(FP_SIZE)] + [name for name, _ in DESCRIPTORS]
 
 
 def mol_to_features(mol):
-    # Build the feature row for an already parsed molecule.
-    # Kept separate from smiles_to_fp so callers that already hold a mol object
-    # (explain.py, the app) do not pay to parse the same SMILES twice.
+    # Build the number row for a molecule that is already parsed.
+    # Separate from smiles_to_fp so callers holding a parsed molecule already
+    # (explain.py, the app) do not pay to parse the same text twice.
     row = np.zeros(N_FEATURES, dtype=np.float32)
 
-    # Fragment counts. Only about 50 of the 2048 columns are ever non-zero, so
-    # we fill them straight from the sparse dictionary RDKit hands back rather
-    # than walking all 2048.
+    # Fill in the fragment counts. Only ~50 of the 2048 boxes are ever non-zero,
+    # so read straight from the short list RDKit gives back instead of looping
+    # over all 2048 and writing mostly zeros.
     for bit, count in MORGAN_GEN.GetCountFingerprint(mol).GetNonzeroElements().items():
         row[bit] = count
 
@@ -81,21 +86,21 @@ def mol_to_features(mol):
         try:
             row[FP_SIZE + position] = function(mol)
         except Exception:
-            # A handful of odd structures make one descriptor fail. Writing 0.0
-            # is safer than letting one molecule abort a 12k featurisation run.
+            # A few strange structures make one descriptor fail. Writing 0.0 is
+            # better than letting one bad molecule kill a 12,000 molecule run.
             row[FP_SIZE + position] = 0.0
 
-    # A descriptor can return inf or nan on a pathological molecule, and either
-    # would poison training silently rather than raising.
+    # A descriptor can also return infinity or nan on a broken molecule. Either
+    # one would quietly ruin training instead of raising an error, so clean them.
     return np.nan_to_num(row, nan=0.0, posinf=0.0, neginf=0.0)
 
 
 def smiles_to_fp(smiles):
-    # Return the N_FEATURES long feature row, or None if RDKit cannot parse it.
+    # Text in, number row out. None if RDKit cannot make sense of the text.
     # This is what the models take as input.
     #
-    # The name is kept from the earlier fingerprint-only version so that
-    # combine.py, the Streamlit app and the tests keep working unchanged.
+    # The name is left over from when this returned only a fingerprint. It is
+    # kept so combine.py, the app and the tests do not all have to change.
     mol = Chem.MolFromSmiles(smiles)
     if mol is None:
         return None
@@ -103,9 +108,9 @@ def smiles_to_fp(smiles):
 
 
 def smiles_to_bits(smiles):
-    # Plain 0/1 fingerprint, no counts and no descriptors.
-    # Use this, and only this, for Tanimoto similarity and the applicability
-    # domain. See the warning in the module header above.
+    # Yes/no boxes only: no counts, no whole-molecule facts.
+    # This is the one to use for Tanimoto similarity and the applicability
+    # domain. See the trap described at the top of this file.
     mol = Chem.MolFromSmiles(smiles)
     if mol is None:
         return None
@@ -116,9 +121,9 @@ def smiles_to_bits(smiles):
 
 
 def bits_from_matrix(X):
-    # Recover the 0/1 fingerprints from a feature matrix built by this module.
-    # "the fragment appeared at least once" is exactly the plain fingerprint,
-    # so the applicability domain never needs a second matrix saved to disk.
+    # Get the yes/no boxes back out of a matrix this file already built.
+    # "this fragment appeared at least once" is exactly the yes/no version, so
+    # the domain never needs a second copy of the fingerprints saved to disk.
     X = np.asarray(X)
     if X.ndim == 1:
         X = X.reshape(1, -1)
@@ -132,9 +137,11 @@ def bits_from_matrix(X):
 
 
 def smiles_list_to_matrix(smiles_list):
-    # Featurise many molecules at once.
-    # Bad SMILES are skipped, so we also return the indices that survived.
-    # Callers need those indices to line the labels back up with the rows.
+    # Do many molecules at once.
+    #
+    # Unparseable ones get skipped, so we also return which positions survived.
+    # The caller needs those to line its labels and names back up with the rows,
+    # otherwise row 5 gets the name of molecule 5 when it is really molecule 7.
     rows = []
     kept = []
     for i in range(len(smiles_list)):

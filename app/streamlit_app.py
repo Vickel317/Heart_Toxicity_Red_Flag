@@ -47,13 +47,12 @@ def load_pipeline():
         "model_a": os.path.join(PROCESSED_DIR, "model_a.joblib"),
         "model_b": os.path.join(PROCESSED_DIR, "model_b.joblib"),
         "domain": os.path.join(PROCESSED_DIR, "domain_a.npz"),
-        "substrates": os.path.join(PROCESSED_DIR, "cyp3a4_substrates.csv"),
-        "qt": os.path.join(PROCESSED_DIR, "qt_drugs.csv"),
+        "panel": os.path.join(PROCESSED_DIR, "screen_drugs.csv"),
     }
     needed_by = {
         "model_a": "notebook 02", "domain": "notebook 02",
         "model_b": "notebook 03",
-        "substrates": "notebook 05", "qt": "notebook 05",
+        "panel": "notebook 05",
     }
     for key, path in paths.items():
         if not os.path.exists(path):
@@ -66,26 +65,16 @@ def load_pipeline():
         "model_b": joblib.load(paths["model_b"]),
         "domain": applicability.load_domain(paths["domain"]),
     }
-    substrates = pd.read_csv(paths["substrates"])
-    qt = pd.read_csv(paths["qt"])
-    bundle["substrate_lookup"] = combine.build_substrate_lookup(substrates)
-    bundle["qt_lookup"] = combine.build_qt_lookup(qt)
-    bundle["drug_names"] = sorted(
-        set(substrates["name"].astype(str)) | set(qt["name"].astype(str))
-    )
-
-    smiles_path = os.path.join(
-        os.path.dirname(PROCESSED_DIR), "raw", "drug_smiles.csv"
-    )
-    if os.path.exists(smiles_path):
-        ds = pd.read_csv(smiles_path)
-        bundle["drug_smiles"] = {
-            str(n): str(s)
-            for n, s in zip(ds["name"], ds["smiles"])
-            if isinstance(s, str) and s and s != "nan"
-        }
-    else:
-        bundle["drug_smiles"] = {}
+    # One panel file carries the drug names, their structures and both
+    # conditions, so there is nothing here that can fall out of step.
+    panel = pd.read_csv(paths["panel"])
+    bundle["substrate_lookup"], bundle["qt_lookup"] = combine.lookups_from_panel(panel)
+    bundle["drug_names"] = sorted(set(panel["name"].astype(str)))
+    bundle["drug_smiles"] = {
+        str(name): str(smiles)
+        for name, smiles in zip(panel["name"], panel["smiles"])
+        if isinstance(smiles, str) and smiles and smiles != "nan"
+    }
     return bundle, []
 
 

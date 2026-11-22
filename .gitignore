@@ -3,8 +3,3 @@ __pycache__/
 .ipynb_checkpoints/
 
 .venv/
-
-data/
-*.tab
-*.csv
-*.json
