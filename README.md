@@ -23,8 +23,8 @@ A pair is flagged only if all three are true:
 3. **The drug blocks hERG or prolongs QT.** Predicted by Model B, or taken from the
    CredibleMeds QT list.
 
-The two model probabilities are never multiplied together. Random Forest outputs are
-not calibrated, so their product has no meaning. The screen reports a tier instead:
+The two model probabilities are never multiplied together. Neither model is calibrated,
+so their product has no meaning. The screen reports a tier instead:
 
 | Tier | Meaning |
 | --- | --- |
@@ -37,10 +37,43 @@ between tiers.
 
 ## Models and targets
 
-| Model | Dataset | Size | Target |
-| --- | --- | --- | --- |
-| Model A | TDC `CYP3A4_Veith` | about 12k compounds | ROC-AUC >= 0.80 |
-| Model B | TDC `hERG` | a few hundred compounds | ROC-AUC >= 0.85, scaffold split or cross validation because the set is small |
+| Model | Dataset | Size | Target | Achieved |
+| --- | --- | --- | --- | --- |
+| Model A | TDC `CYP3A4_Veith` | 12,328 compounds | ROC-AUC >= 0.80 | **0.802** scaffold split (0.913 random) |
+| Model B | TDC `hERG` | 655 compounds | ROC-AUC >= 0.85, scaffold split or cross validation because the set is small | not trained yet |
+
+**Report the scaffold number, not the random one.** A random split scatters analogue
+series across train and test, so the model scores well partly by recognising cores it has
+already seen. On Model A that inflated ROC-AUC by 0.11. A Bemis-Murcko scaffold split
+keeps every shared ring core on one side, so the test set is chemistry the model has
+genuinely never met.
+
+### Features
+
+Each molecule becomes 2058 numbers: 2048 Morgan fingerprint **counts** (radius 2) plus 10
+whole-molecule descriptors (weight, logP, TPSA, ring count and so on). Counts beat plain
+0/1 bits because six aromatic rings and one do not behave alike in the liver, and the
+descriptors capture CYP3A4's preference for large, greasy molecules, which no single
+fragment bit expresses. Both choices were picked on a validation split before the test set
+was touched; the comparison is in `data/processed/model_a_feature_search.csv`.
+
+The applicability domain runs on plain 0/1 fingerprints instead, because Tanimoto
+similarity is only defined for sets, and molecular weight would otherwise swamp it.
+
+### Algorithm
+
+Histogram gradient boosting, not Random Forest. On the scaffold split it beat a forest by
+about 0.04 ROC-AUC, which was the difference between missing and meeting the target. It is
+also the only one of the two that `shap.TreeExplainer` can explain: on our Random Forest
+SHAP fails its own additivity check, while on the boosted model it runs in a fraction of a
+second.
+
+### Data
+
+The TDC `.tab` files are downloaded from Harvard Dataverse and read with `pandas`. The
+`pytdc` package is deliberately **not** a dependency: it pins numpy<2, pandas<3 and
+rdkit<2024.3.1, and on Windows it pulls in `tiledbsoma`, which has no wheel and fails to
+build. The download URLs are in notebook 01.
 
 ## How to run
 
@@ -53,8 +86,8 @@ jupyter lab
 
 Run the notebooks in order:
 
-1. `notebooks/01_data_loading.ipynb` loads both TDC datasets and builds fingerprints. This one runs end to end today.
-2. `notebooks/02_model_a_cyp3a4.ipynb` trains and evaluates Model A.
+1. `notebooks/01_data_loading.ipynb` downloads both TDC datasets and builds features. Runs end to end.
+2. `notebooks/02_model_a_cyp3a4.ipynb` trains and evaluates Model A, and fits the applicability domain. Runs end to end.
 3. `notebooks/03_model_b_herg.ipynb` trains and evaluates Model B.
 4. `notebooks/04_shap_analysis.ipynb` SHAP, bit to substructure mapping, Fisher test.
 5. `notebooks/05_lookup_tables.ipynb` CredibleMeds QT list intersected with the FDA CYP3A4 substrate table.

@@ -3,37 +3,91 @@
 # training set. Plant natural products often do not look like the synthetic
 # drug-like compounds in CYP3A4_Veith, so this gate produces the Unknown tier.
 
-# STUB. Nothing here is implemented yet.
+import numpy as np
+
+# How many nearest training neighbours define "is this molecule in familiar territory".
+N_NEIGHBOURS = 5
+
+# The sparsest 5 percent of the training set sets the bar. Anything less typical
+# than that is called outside the domain.
+DOMAIN_PERCENTILE = 5
 
 
 def tanimoto(fp_a, fp_b):
-    # Tanimoto similarity between two 0/1 numpy fingerprint arrays.
-    # TODO:
-    #   1. shared = number of bits set in both.
-    #   2. total = bits set in a, plus bits set in b, minus shared.
-    #   3. Return shared / total, and 0.0 when total is 0.
-    pass
+    # Tanimoto similarity between two 0/1 fingerprint arrays.
+    # shared bits / total distinct bits. 1.0 means identical fingerprints.
+    fp_a = np.asarray(fp_a)
+    fp_b = np.asarray(fp_b)
+    shared = float(np.logical_and(fp_a, fp_b).sum())
+    total = float(fp_a.sum()) + float(fp_b.sum()) - shared
+    if total == 0:
+        return 0.0
+    return shared / total
 
 
-def fit_domain(X_train):
+def tanimoto_matrix(A, B):
+    # Same formula as tanimoto(), but for every row of A against every row of B
+    # at once. Comparing 12k molecules to each other one pair at a time would be
+    # 152 million Python loops; as a matrix multiply it takes a few seconds.
+    #
+    # The trick: for 0/1 vectors, the dot product IS the count of shared bits.
+    A = np.asarray(A, dtype=np.float32)
+    B = np.asarray(B, dtype=np.float32)
+    shared = A @ B.T
+    bits_a = A.sum(axis=1)[:, None]
+    bits_b = B.sum(axis=1)[None, :]
+    total = bits_a + bits_b - shared
+    # where=total > 0 avoids dividing by zero for empty fingerprints.
+    return np.divide(shared, total, out=np.zeros_like(shared), where=total > 0)
+
+
+def _mean_top_neighbours(sim_rows, n_neighbours):
+    # Average of the n highest similarities in each row.
+    # np.partition is used instead of sorting because we only need the top n,
+    # not the full ordering.
+    n_neighbours = min(n_neighbours, sim_rows.shape[1])
+    top = np.partition(sim_rows, -n_neighbours, axis=1)[:, -n_neighbours:]
+    return top.mean(axis=1)
+
+
+def fit_domain(X_train, chunk_size=512):
     # Work out the similarity floor from the training fingerprints.
-    # TODO the rule:
-    #   1. For each training molecule, compute its Tanimoto similarity to every
-    #      other training molecule.
-    #   2. Take its 5 nearest neighbours, excluding itself.
-    #   3. Average those 5 similarities. That is the molecule's density score.
-    #   4. The floor is the 5th percentile of all the density scores, so the
-    #      sparsest 5 percent of the training set sets the bar.
-    #   5. Return the floor together with X_train, because scoring a new
-    #      molecule needs both.
-    pass
+    # For each training molecule: how similar is it to its 5 nearest neighbours?
+    # A molecule sitting in a crowded, well covered region scores high.
+    # The floor is the 5th percentile of those scores.
+    X_train = np.asarray(X_train, dtype=np.uint8)
+    n = len(X_train)
+    scores = np.zeros(n, dtype=np.float32)
+
+    # Done in chunks of rows so we never hold a 12k x 12k matrix in memory.
+    for start in range(0, n, chunk_size):
+        stop = min(start + chunk_size, n)
+        sim = tanimoto_matrix(X_train[start:stop], X_train)
+        # A molecule is always identical to itself, so blank out the diagonal
+        # before taking neighbours, otherwise every score is inflated by a 1.0.
+        for row in range(stop - start):
+            sim[row, start + row] = -1.0
+        scores[start:stop] = _mean_top_neighbours(sim, N_NEIGHBOURS)
+
+    floor = float(np.percentile(scores, DOMAIN_PERCENTILE))
+    return {"X_train": X_train, "floor": floor, "train_scores": scores}
+
+
+def domain_scores(X_new, domain, chunk_size=512):
+    # Similarity-to-training score for many new molecules at once.
+    # Notebook 06 screens thousands of herb compounds, so this is the batch path.
+    X_new = np.asarray(X_new, dtype=np.uint8)
+    out = np.zeros(len(X_new), dtype=np.float32)
+    for start in range(0, len(X_new), chunk_size):
+        stop = min(start + chunk_size, len(X_new))
+        sim = tanimoto_matrix(X_new[start:stop], domain["X_train"])
+        out[start:stop] = _mean_top_neighbours(sim, N_NEIGHBOURS)
+    return out
 
 
 def check_molecule(fp, domain):
     # Decide whether one new molecule is inside the domain.
-    # TODO:
-    #   1. Tanimoto of fp against every training fingerprint in domain.
-    #   2. Mean of the 5 highest of those similarities.
-    #   3. Below the floor returns "outside domain", otherwise "inside domain".
-    # Returning a placeholder so callers can be written before this works.
-    return "unknown"
+    score = float(domain_scores(np.asarray(fp)[None, :], domain)[0])
+    if score < domain["floor"]:
+        return "outside domain"
+    return "inside domain"
